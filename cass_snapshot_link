@@ -1,0 +1,258 @@
+#!/usr/bin/env python
+# encoding: utf-8
+
+# Copyright 2012 Aaron Morton
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import errno
+import logging
+import os
+import sys
+import traceback
+
+def link_snapshots(snapshot_name, all_names, keyspaces, data_dir, link_dir, 
+    replace_existing, dry_run):
+    """Links the snapshots. 
+    
+    Args are the same as the command line args.
+    """
+    log = logging.getLogger(__name__)
+
+    # Step 1, get a list of all the files in the snapshot. 
+    log.debug("Building list of snapshots")
+    all_snapshots = list(_gen_snapshot_dirs(snapshot_name, all_names, 
+        keyspaces, data_dir))
+    log.debug("All snapshots %(all_snapshots)s" % vars())
+
+    # Step 2 - create the tasks we want to run
+    # also filter out existing links
+    # list of (exists, path, target)
+    log.debug("Building task list")
+    link_tasks = _link_tasks(all_snapshots, link_dir, replace_existing)
+    log.debug("Task list %(link_tasks)s" % vars())
+
+    if dry_run:
+        str_build = ["Dry Run: following changes would normally be made."]
+        for existing, link_path, ss_dir in link_tasks:
+            if existing:
+                str_build.append("Remove existing: %(link_path)s" % vars())
+            str_build.append("Link %(link_path)s to %(ss_dir)s" % vars())
+        return "\n".join(str_build)
+
+    # Step 3, link them up 
+    log.debug("Linking")
+    str_build = ["Linked:"]
+    if not link_tasks:
+        str_build.append("Nothing to link, see logs for details.")
+        
+    for remove_first, link_path, ss_dir in link_tasks:
+
+        if remove_first:
+            log.debug("Deleting %(link_path)s" % vars())
+            os.remove(link_path)
+
+        log.debug("Linking %(link_path)s to %(ss_dir)s" % vars())
+        try:
+            os.makedirs(os.path.dirname(link_path))
+        except (EnvironmentError) as e:
+            if e.errno != errno.EEXIST:
+                raise
+
+        os.symlink(ss_dir, link_path)   
+
+        if remove_first:
+            str_build.append("Replaced %(link_path)s with link to %(ss_dir)s" \
+                % vars())
+        else:
+            str_build.append("Linked %(link_path)s to %(ss_dir)s" % vars())
+
+    return "\n".join(str_build)
+
+
+def _gen_snapshot_dirs(snapshot_name, all_names, keyspaces, data_dir):
+    """Yields the snapshot directories we want to sym link. 
+    """
+
+    for root, dirs, files in os.walk(data_dir):
+        if root == data_dir:
+            # Top level dir.
+            # filter the keyspaces 
+            if keyspaces:
+                exclude_ks = set(dirs).difference(keyspaces)
+                for ks in exclude_ks:
+                    dirs.remove(ks)
+            continue
+
+        # Are we in a snapshot dir?
+        head, tail = os.path.split(root) 
+        if tail != "snapshots":
+            # nope 
+            continue 
+
+        # in a snapshots dir
+
+        # format of the current dir is .../ks/cf/snapshots
+        tokens = _split_path_all(root)
+        cf_name = tokens[-2]
+        ks_name = tokens[-3]
+
+        # filter the snapshot names
+        if all_names:
+            for ss_dir in dirs:
+                yield (ss_dir, ks_name, cf_name, os.path.join(root, ss_dir))
+        elif snapshot_name in dirs:
+            yield(snapshot_name, ks_name, cf_name, 
+                os.path.join(root, snapshot_name))
+
+        # we do not want to traverse this dir
+        del dirs[:]
+    # end
+
+def _link_tasks(all_snapshots, link_dir, replace_existing):
+    """Turn the list of ``all_snapshots`` into a list of link tasks. 
+    
+    Returns a list of (remove_existing, link_path, ss_dir)
+    """
+    log = logging.getLogger(__name__)
+
+    link_tasks = []
+    for ss_name, ks_name, cf_name, ss_dir in all_snapshots:
+        link_path = os.path.join(link_dir, "snapshots", ss_name, ks_name, 
+            cf_name)
+        exists = os.path.exists(link_path)
+        is_link = os.path.islink(link_path)
+
+        if exists and not is_link:
+            raise RuntimeError("Link path %(link_path)s exists and is not a"\
+                " sym link. Aborting." % vars())
+
+        if not exists:
+            # free to link
+            link_tasks.append((False, link_path, ss_dir))
+        elif replace_existing:
+            log.info("Existing path %(link_path)s will be replaced" % vars())
+            link_tasks.append((True, link_path, ss_dir))
+        else:
+            log.info("Existing path %(link_path)s skipping snapshot "\
+                "%(ss_name)s for cf %(cf_name)s in ks %(ks_name)s" % vars())
+    return link_tasks
+
+def _split_path_all(path):
+    """Split the ``path`` into a tuple of tokens."""
+    h, t = os.path.split(path)
+    if h == os.path.sep:
+        return (t,)
+    return _split_path_all(path=h) + (t,)
+
+
+
+
+def arg_parser():
+    """Builds a :class:`argparse.ArgumentParser` for the script
+    """
+    
+    epilog = """Creates a directory of sym links for one or all snapshots 
+    for names or all keyspaces. 
+
+    In Cassandra 1.1 the files for a Column Family are located in their own 
+    data directory, and the snapshots are located within those.
+
+    This script creates links as follows:
+
+    snapshots/<snapshot_name>/<keyspace_name>/<cf_name>
+
+    For example in the directory /var/lib/cassandra/data/snapshots/foo/system:
+
+    LocationInfo -> /var/lib/cassandra/data/system/LocationInfo/snapshots/foo
+    Versions -> /var/lib/cassandra/data/system/Versions/snapshots/foo
+    """
+    main_parser = argparse.ArgumentParser(
+        description="Sym link Cassandra 1.1 snapshots.", 
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=epilog)
+
+    main_parser.add_argument("snapshot_name", nargs="?",
+        help="Name of the snapshot to link, optional if --all is used.")
+
+    main_parser.add_argument("--data-dir", default="/var/lib/cassandra/data", 
+        dest="data_dir",
+        help="Path to the cassandra data directory "\
+            "(default /var/lib/cassandra/data).")
+    main_parser.add_argument("--link-dir", default="/var/lib/cassandra/data", 
+        dest="link_dir",
+        help="Directory to create the snapshot links in "\
+            "(default /var/lib/cassandra/data).")
+
+    main_parser.add_argument("--keyspace", nargs="*", 
+        help="Name of the keyspaces to link from, if not specified "\
+        "links all.")
+
+    main_parser.add_argument("--all", default=False, action="store_true", 
+        dest="all_snapshots",
+        help="Link all found snapshots.")
+    main_parser.add_argument("--replace-existing", default=False, 
+        action="store_true", 
+        help="Replace existing links, otherwise do not link.")
+    main_parser.add_argument("--dry-run", default=False, 
+        action="store_true", dest="dry_run", 
+        help="Do not change anything.")
+
+    main_parser.add_argument("--no-logging", default=False, 
+        dest="no_logging", action="store_true", 
+        help="Disable logging.")
+    main_parser.add_argument("--log-level", default="DEBUG", 
+        dest="log_level", 
+        choices=["FATAL", "CRITICAL", "ERROR", "WARN", "INFO", "DEBUG"],
+        help="Logging level default (DEBUG).")
+
+    main_parser.add_argument("--log-file", default="./cass_snapshot_link.log", 
+    dest="log_file", 
+    help="Logging file (default ./cass_snapshot_link.log).")
+
+    return main_parser
+
+def main():
+    args = arg_parser().parse_args()
+
+    # Setup Logging 
+    if not args.no_logging:
+        logging.basicConfig(filename=os.path.abspath(args.log_file), 
+            level=getattr(logging, args.log_level))
+    log = logging.getLogger(__name__)
+    log.debug("Got command args %(args)s" % vars())
+
+    # Validate Args
+    if not args.snapshot_name and not args.all_snapshots:
+        raise argparse.ArgumentError(args.snapshot_name, 
+            "A snapshot-name must provided is all is not specified.")
+    if not os.path.isdir(args.data_dir):
+        raise argparse.ArgumentError(args.data_dir, 
+            "Data directory must exist.")
+    
+    # Link it up.
+    try:
+        out = link_snapshots(args.snapshot_name, args.all_snapshots, 
+            args.keyspace, args.data_dir, args.link_dir, 
+            args.replace_existing, args.dry_run)
+    except (Exception) as exc:
+        print "Error:"
+        traceback.print_exc()
+        sys.exit(1)
+    
+    sys.stdout.write(str(out) + "\n")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
