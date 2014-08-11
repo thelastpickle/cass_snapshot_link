@@ -153,6 +153,4 @@ lrwxr-xr-x  1 aaron  wheel    64B 19 Nov 16:15 Standard1 -> /var/lib/cassandra/d
 Questions, Comments, and Help
 -----------------------------
 
-* Raise an issue on [github project](https://github.com/amorton/cass_snapshot_link)
-* IRC `#cassandra-ops` on `irc.freenode.net`
-* Email the Cassandra [User List](http://cassandra.apache.org/)
+* Raise an issue on [github project](https://github.com/thelastpickle/cass_snapshot_link)
