@@ -22,140 +22,302 @@ import os
 import sys
 import traceback
 
+# logger set in main()
+log = None
+
+# ============================================================================
+# 
+
+class LinkTask(object):
+    
+    def __init__(self, source_path, link_path, remove_existing):
+        self.source_path = source_path
+        self.link_path = link_path
+        self.remove_existing = remove_existing
+        
+    def __call__(self):
+        """Perform the link and return a string describing the action."""
+        
+        if not all( (self.source_path, self.link_path)):
+            raise RuntimeError("Missing parameters")
+        
+        if self.remove_existing:
+            log.debug("Deleting %(link_path)s" % vars(self))
+            os.remove(link_path)
+
+        log.debug("Linking %(link_path)s to %(source_path)s" % vars(self))
+        
+        # ensure we have th directory to put the link in.
+        try:
+            os.makedirs(os.path.dirname(self.link_path))
+        except (EnvironmentError) as e:
+            if e.errno != errno.EEXIST:
+                raise
+        
+        os.symlink(self.source_path, self.link_path)   
+
+        if self.remove_existing:
+            return "Replaced %(link_path)s with link to %(source_path)s" \
+                % vars(self)
+
+        return "Linked %(link_path)s to %(source_path)s" % vars(self)
+
+    def dry_run(self, str_builder):
+        """Append to the string builder what would happen if this task was 
+        run."""
+        
+        if self.remove_existing:
+            str_builder.append("Remove existing: %(link_path)s" % vars(self))
+        str_builder.append("Link %(link_path)s to %(source_path)s" % vars(
+            self))
+        return
+        
+    # ------------------------------------------------------------------------
+    
+    @classmethod
+    def link_tasks_for_files(cls, snapshots, link_dir, replace_existing, 
+        jbod_splits):
+        """Create LinkTask's for the files in the ``snapshots`` to create
+        links in ``link_dir`` split into ``jbod_split`` directories. 
+    
+        If ``replace_existing`` the original link is removed and a new one 
+        created, otherwise it is left in place. 
+        """
+
+        this_jbod_disk = 0
+        link_tasks = []
+
+        # build  list of (snapshot, source_file, jbod)
+        files_and_jbod = []
+        for snapshot in snapshots:
+            # get a list of [ (component, component)]
+            sstables = snapshot._size_ordered_sstables()
+
+            for sstable in sstables:
+                for component in sstable:
+                    files_and_jbod.append((snapshot, component, 
+                        this_jbod_disk))
+                this_jbod_disk = (this_jbod_disk + 1) % jbod_splits
+        # next
+        
+        for snapshot, source_file, jbod in files_and_jbod:
+            _, file_name = os.path.split(source_file) 
+            link_path = os.path.join(link_dir, "snapshots", snapshot.name, 
+                "jbod-%s" % jbod, snapshot.keyspace, snapshot.column_family, 
+                file_name)
+                
+            exists = os.path.exists(link_path)
+            is_link = os.path.islink(link_path)
+
+            if exists and not is_link:
+                raise RuntimeError("Link path %(link_path)s exists and is not a"\
+                    " sym link. Aborting." % vars())
+
+            if not exists:
+                # free to link
+                link_tasks.append(LinkTask(source_file, link_path, False))
+                
+            elif replace_existing:
+                link_tasks.append(LinkTask(source_file, link_path, True))
+
+            else:
+                log.info("Existing path %(link_path)s skipping snapshot file"\
+                    "%(source_file)s" % vars())
+        return link_tasks
+
+    @classmethod
+    def link_tasks_for_directories(cls, snapshots, link_dir, replace_existing):
+        """Create LinkTask's for the directories in the ``snapshots`` to create
+        links in ``link_dir``. 
+    
+        If ``replace_existing`` the original link is removed and a new one 
+        created, otherwise it is left in place. 
+        """
+
+        link_tasks = []
+        
+        for snapshot in snapshots:
+            
+            link_path = os.path.join(link_dir, "snapshots", snapshot.name, 
+                snapshot.keyspace, snapshot.column_family)
+            exists = os.path.exists(link_path)
+            is_link = os.path.islink(link_path)
+
+            if exists and not is_link:
+                raise RuntimeError("Link path %(link_path)s exists and is "\
+                    "not a sym link. Aborting." % vars())
+
+            if not exists:
+                # free to link
+                link_tasks.append(LinkTask(snapshot.path, link_path, False))
+                
+            elif replace_existing:
+                link_tasks.append(LinkTask(snapshot.path, link_path, True))
+
+            else:
+                log.info("Existing path %s skipping snapshot "\
+                    "%s" % (link_path, snapshot.path))
+        return link_tasks
+
+
+
+
+# ============================================================================
+# 
+
+class Snapshot(object):
+    
+    def __init__(self):
+        self.name = None
+        self.keyspace = None
+        self.column_family = None
+        self.path = None
+
+    def _size_ordered_sstables(self):
+        """Group the files in the directory by SSTable and order the groups by 
+        descending size order.
+    
+        Returns [ (file_path, file_path)] all file_paths in the tuple are from 
+        the same sstable.
+        """
+
+    
+        # table_number to (file_path, file_path) 
+        sstable_files = {}
+        _, _, files = os.walk(self.path).next()
+        
+        for file in files:
+            # expecting system-local-jb-1-Data.db
+            tokens = file.split("-")
+            assert len(tokens) == 5
+            table_number = int(tokens[3])
+            sstable_files.setdefault(table_number, []).append(
+                os.path.join(self.path, file))
+
+        sstables = [
+            tuple(v)
+            for v in sstable_files.values()
+        ]
+    
+        def _sstable_sort_key(files):
+            for file in files:
+                if file.endswith("-Data.db"):
+                    return os.path.getsize(file)
+            raise RuntimeError("No Data File in %s" % (files,))
+                
+        sstables.sort(key=_sstable_sort_key)
+        
+        return sstables
+        
+    @classmethod
+    def get_snapshots(cls, snapshot_name, all_snapshots, keyspaces, data_dir):
+        """Create a list of Snapshot's from the snapshots found in the 
+        ``data_dir``. 
+        
+        If ``all_snapshots`` is set all snapshots are included otherwise the 
+        one with ``snapshot_name`` is. 
+        
+        If ``keyspaces`` is a non empty list only snapshots from those 
+        keyspaces are included. Otherwise all keyspaces are. 
+        """
+
+        snapshots = []
+        
+        for root, dirs, files in os.walk(data_dir):
+            
+            if root == data_dir:
+                # Top level dir.
+                # filter the keyspaces 
+                if keyspaces:
+                    exclude_ks = set(dirs).difference(keyspaces)
+                    for ks in exclude_ks:
+                        dirs.remove(ks)
+                continue
+
+            # Are we in a snapshot dir?
+            head, tail = os.path.split(root) 
+            if tail != "snapshots":
+                # nope 
+                continue 
+
+            # in a snapshots dir
+
+            # format of the current dir is .../ks/cf/snapshots
+            tokens = cls._split_path_all(root)
+            cf_name = tokens[-2]
+            ks_name = tokens[-3]
+
+            # filter the snapshot names
+            if all_snapshots:
+                for snapshot_dir in dirs:
+                    snapshot = Snapshot()
+                    snapshot.name = snapshot_dir
+                    snapshot.keyspace = ks_name
+                    snapshot.column_family = cf_name
+                    snapshot.path = os.path.join(root, snapshot_dir)
+                    snapshots.append(snapshot)
+                    
+            elif snapshot_name in dirs:
+                snapshot = Snapshot()
+                snapshot.name = snapshot_name
+                snapshot.keyspace = ks_name
+                snapshot.column_family = cf_name
+                snapshot.path = os.path.join(root, snapshot_name)
+                snapshots.append(snapshot)
+
+            # we do not want to traverse this dir
+            del dirs[:]
+        return snapshots
+        
+    @classmethod
+    def _split_path_all(cls, path):
+        """Split the ``path`` into a tuple of tokens."""
+        h, t = os.path.split(path)
+        if h == os.path.sep:
+            return (t,)
+        return cls._split_path_all(path=h) + (t,)
+        
+# ============================================================================
+# 
+
 def link_snapshots(snapshot_name, all_names, keyspaces, data_dir, link_dir, 
-    replace_existing, dry_run):
+    replace_existing, dry_run, jbod_splits):
     """Links the snapshots. 
     
     Args are the same as the command line args.
     """
-    log = logging.getLogger(__name__)
 
-    # Step 1, get a list of all the files in the snapshot. 
+    # Step 1, get a list of all the directories in the snapshot. 
     log.debug("Building list of snapshots")
-    all_snapshots = list(_gen_snapshot_dirs(snapshot_name, all_names, 
-        keyspaces, data_dir))
-    log.debug("All snapshots %(all_snapshots)s" % vars())
+    snapshots = Snapshot.get_snapshots(snapshot_name, all_names, 
+        keyspaces, data_dir)
 
     # Step 2 - create the tasks we want to run
-    # also filter out existing links
-    # list of (exists, path, target)
     log.debug("Building task list")
-    link_tasks = _link_tasks(all_snapshots, link_dir, replace_existing)
-    log.debug("Task list %(link_tasks)s" % vars())
+    if jbod_splits > 0 :
+        tasks = LinkTask.link_tasks_for_files(snapshots, link_dir, 
+            replace_existing, jbod_splits)
+    else:
+        tasks = LinkTask.link_tasks_for_directories(snapshots, link_dir, 
+            replace_existing)
 
     if dry_run:
         str_build = ["Dry Run: following changes would normally be made."]
-        for existing, link_path, ss_dir in link_tasks:
-            if existing:
-                str_build.append("Remove existing: %(link_path)s" % vars())
-            str_build.append("Link %(link_path)s to %(ss_dir)s" % vars())
+        for task in tasks:
+            task.dry_run(str_build)
         return "\n".join(str_build)
 
     # Step 3, link them up 
     log.debug("Linking")
     str_build = ["Linked:"]
-    if not link_tasks:
-        str_build.append("Nothing to link, see logs for details.")
-        
-    for remove_first, link_path, ss_dir in link_tasks:
-
-        if remove_first:
-            log.debug("Deleting %(link_path)s" % vars())
-            os.remove(link_path)
-
-        log.debug("Linking %(link_path)s to %(ss_dir)s" % vars())
-        try:
-            os.makedirs(os.path.dirname(link_path))
-        except (EnvironmentError) as e:
-            if e.errno != errno.EEXIST:
-                raise
-
-        os.symlink(ss_dir, link_path)   
-
-        if remove_first:
-            str_build.append("Replaced %(link_path)s with link to %(ss_dir)s" \
-                % vars())
-        else:
-            str_build.append("Linked %(link_path)s to %(ss_dir)s" % vars())
-
-    return "\n".join(str_build)
-
-
-def _gen_snapshot_dirs(snapshot_name, all_names, keyspaces, data_dir):
-    """Yields the snapshot directories we want to sym link. 
-    """
-
-    for root, dirs, files in os.walk(data_dir):
-        if root == data_dir:
-            # Top level dir.
-            # filter the keyspaces 
-            if keyspaces:
-                exclude_ks = set(dirs).difference(keyspaces)
-                for ks in exclude_ks:
-                    dirs.remove(ks)
-            continue
-
-        # Are we in a snapshot dir?
-        head, tail = os.path.split(root) 
-        if tail != "snapshots":
-            # nope 
-            continue 
-
-        # in a snapshots dir
-
-        # format of the current dir is .../ks/cf/snapshots
-        tokens = _split_path_all(root)
-        cf_name = tokens[-2]
-        ks_name = tokens[-3]
-
-        # filter the snapshot names
-        if all_names:
-            for ss_dir in dirs:
-                yield (ss_dir, ks_name, cf_name, os.path.join(root, ss_dir))
-        elif snapshot_name in dirs:
-            yield(snapshot_name, ks_name, cf_name, 
-                os.path.join(root, snapshot_name))
-
-        # we do not want to traverse this dir
-        del dirs[:]
-    # end
-
-def _link_tasks(all_snapshots, link_dir, replace_existing):
-    """Turn the list of ``all_snapshots`` into a list of link tasks. 
     
-    Returns a list of (remove_existing, link_path, ss_dir)
-    """
-    log = logging.getLogger(__name__)
-
-    link_tasks = []
-    for ss_name, ks_name, cf_name, ss_dir in all_snapshots:
-        link_path = os.path.join(link_dir, "snapshots", ss_name, ks_name, 
-            cf_name)
-        exists = os.path.exists(link_path)
-        is_link = os.path.islink(link_path)
-
-        if exists and not is_link:
-            raise RuntimeError("Link path %(link_path)s exists and is not a"\
-                " sym link. Aborting." % vars())
-
-        if not exists:
-            # free to link
-            link_tasks.append((False, link_path, ss_dir))
-        elif replace_existing:
-            log.info("Existing path %(link_path)s will be replaced" % vars())
-            link_tasks.append((True, link_path, ss_dir))
-        else:
-            log.info("Existing path %(link_path)s skipping snapshot "\
-                "%(ss_name)s for cf %(cf_name)s in ks %(ks_name)s" % vars())
-    return link_tasks
-
-def _split_path_all(path):
-    """Split the ``path`` into a tuple of tokens."""
-    h, t = os.path.split(path)
-    if h == os.path.sep:
-        return (t,)
-    return _split_path_all(path=h) + (t,)
-
+    if not tasks:
+        str_build.append("Nothing to link, see logs for details.")
+            
+    for task in tasks:
+        str_build.append(task())
+    
+    return "\n".join(str_build)
 
 
 
@@ -190,10 +352,10 @@ def arg_parser():
         dest="data_dir",
         help="Path to the cassandra data directory "\
             "(default /var/lib/cassandra/data).")
-    main_parser.add_argument("--link-dir", default="/var/lib/cassandra/data", 
+    main_parser.add_argument("--link-dir", default="/var/lib/cassandra", 
         dest="link_dir",
         help="Directory to create the snapshot links in "\
-            "(default /var/lib/cassandra/data).")
+            "(default /var/lib/cassandra).")
 
     main_parser.add_argument("--keyspace", nargs="*", 
         help="Name of the keyspaces to link from, if not specified "\
@@ -205,6 +367,10 @@ def arg_parser():
     main_parser.add_argument("--replace-existing", default=False, 
         action="store_true", 
         help="Replace existing links, otherwise do not link.")
+    main_parser.add_argument("--jbod-splits", default=0, 
+        dest="jbod_splits", type=int,
+        help="Number of JOB drives to split the existing SSTables into, 0 "\
+        "for none.")
     main_parser.add_argument("--dry-run", default=False, 
         action="store_true", dest="dry_run", 
         help="Do not change anything.")
@@ -230,6 +396,7 @@ def main():
     if not args.no_logging:
         logging.basicConfig(filename=os.path.abspath(args.log_file), 
             level=getattr(logging, args.log_level))
+    global log
     log = logging.getLogger(__name__)
     log.debug("Got command args %(args)s" % vars())
 
@@ -245,7 +412,7 @@ def main():
     try:
         out = link_snapshots(args.snapshot_name, args.all_snapshots, 
             args.keyspace, args.data_dir, args.link_dir, 
-            args.replace_existing, args.dry_run)
+            args.replace_existing, args.dry_run, args.jbod_splits)
     except (Exception) as exc:
         print "Error:"
         traceback.print_exc()
