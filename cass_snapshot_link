@@ -204,8 +204,8 @@ class Snapshot(object):
                 if file.endswith("-Data.db"):
                     return os.path.getsize(file)
             raise RuntimeError("No Data File in %s" % (files,))
-                
-        sstables.sort(key=_sstable_sort_key)
+        
+        sstables.sort(key=_sstable_sort_key, reverse=True)
         
         return sstables
         
