@@ -187,9 +187,16 @@ class Snapshot(object):
         _, _, files = os.walk(self.path).next()
         
         for file in files:
+            if file.endswith(".json"):
+                # LCS manifest 
+                # add it to it's own hash value so we copy it. 
+                sstable_files.setdefault(file, []).append(
+                                os.path.join(self.path, file))
+                continue
+                
             # expecting system-local-jb-1-Data.db
             tokens = file.split("-")
-            assert len(tokens) == 5
+            assert len(tokens) == 5, "only %s tokens from %s" % (len(tokens), file)
             table_number = int(tokens[3])
             sstable_files.setdefault(table_number, []).append(
                 os.path.join(self.path, file))
@@ -203,7 +210,8 @@ class Snapshot(object):
             for file in files:
                 if file.endswith("-Data.db"):
                     return os.path.getsize(file)
-            raise RuntimeError("No Data File in %s" % (files,))
+            # use the last file in the list if no db file
+            return os.path.getsize(file)
         
         sstables.sort(key=_sstable_sort_key, reverse=True)
         
