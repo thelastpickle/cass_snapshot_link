@@ -84,22 +84,20 @@ class LinkTask(object):
         created, otherwise it is left in place. 
         """
 
-        this_jbod_disk = 0
         link_tasks = []
 
         # build  list of (snapshot, source_file, jbod)
         files_and_jbod = []
         for snapshot in snapshots:
             # get a list of [ (component, component)]
-            sstables = snapshot._size_ordered_sstables()
-
-            for sstable in sstables:
-                for component in sstable:
+            sstables = snapshot._sstables()    
+            for table_number, components in sstables.iteritems():
+                jbod_disk = table_number % jbod_splits
+                for component in components:
                     files_and_jbod.append((snapshot, component, 
-                        this_jbod_disk))
-                this_jbod_disk = (this_jbod_disk + 1) % jbod_splits
+                        jbod_disk))
         # next
-        
+
         for snapshot, source_file, jbod in files_and_jbod:
             _, file_name = os.path.split(source_file) 
             link_path = os.path.join(link_dir, "snapshots", snapshot.name, 
@@ -173,6 +171,37 @@ class Snapshot(object):
         self.column_family = None
         self.path = None
 
+
+    def _sstables(self):
+        """Group the files in the directory by SSTable.
+    
+        Returns { sstable_number : (file_path, file_path)}
+        
+        If there is a json file it is added with the key being the name 
+        of the file. 
+        """
+
+    
+        # table_number to (file_path, file_path) 
+        sstable_files = {}
+        _, _, files = os.walk(self.path).next()
+        
+        for file in files:
+            if file.endswith(".json"):
+                # LCS manifest 
+                # add it to it's own hash value so we copy it. 
+                sstable_files.setdefault(file, []).append(
+                                os.path.join(self.path, file))
+                continue
+                
+            # expecting system-local-jb-1-Data.db
+            tokens = file.split("-")
+            assert len(tokens) == 5, "only %s tokens from %s" % (len(tokens), file)
+            table_number = int(tokens[3])
+            sstable_files.setdefault(table_number, []).append(
+                os.path.join(self.path, file))
+        return sstable_files
+        
     def _size_ordered_sstables(self):
         """Group the files in the directory by SSTable and order the groups by 
         descending size order.
