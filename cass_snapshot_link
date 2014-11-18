@@ -92,7 +92,10 @@ class LinkTask(object):
             # get a list of [ (component, component)]
             sstables = snapshot._sstables()    
             for table_number, components in sstables.iteritems():
-                jbod_disk = table_number % jbod_splits
+                if isinstance(table_number, basestring):
+                    jbod_disk = 0
+                else:
+                    jbod_disk = table_number % jbod_splits
                 for component in components:
                     files_and_jbod.append((snapshot, component, 
                         jbod_disk))
